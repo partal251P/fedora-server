@@ -678,3 +678,188 @@ On peut vérifier tout les timers:
 ```bash
 systemctl list-timers --all
 ```
+
+## 10. Ajouter un outil de monitoring:
+
+### 1. Installer Docker:
+
+Docker sert a créer des cellules (un peu comme une machine virtuelle) pour chaque service qu'on veut installer. Dans mon cas, je vais commencer par installer Kuma qui permet de ping le serveur et de m'avertir si le server c'est en ligne ou pas.
+
+On installe Docker:
+
+```bash
+sudo dnf install -y dnf-plugins-core
+sudo curl -o /etc/yum.repos.d/docker-ce.repo https://download.docker.com/linux/fedora/docker-ce.repo
+sudo dnf install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+sudo systemctl enable --now docker
+```
+
+On va ensuite tester si Docker marche ou pas:
+
+```bash
+docker run hello-world
+```
+
+### 2. Installer Uptime Kuma:
+
+```bash
+docker volume create uptime-kuma
+
+docker run -d \
+  --restart=always \
+  -p 3001:3001 \
+  -v uptime-kuma:/app/data \
+  --name uptime-kuma \
+  louislam/uptime-kuma
+```
+
+### 3. Configurer le sous domaine (dans cloudflare):
+
+Dans cloudflare, on va créer un nouvel enregistrement DNS de type A:
+
+* Nom : status
+
+* Cible : IP publique ([On peut obtenir avec ce site](https://www.monippublique.com/) )
+
+* Proxied (nuage orange) : Activé
+
+### 4. Installation de Caddy:
+Ca nous permet de plus facilement déployer en HTTPS des sous-domaine dans notre cas. On va donc l'installer:
+
+```bash
+dnf install 'dnf-command(copr)' -y
+dnf copr enable @caddy/caddy -y
+dnf install caddy -y
+```
+
+On va créer un fichier de configuration:
+
+```bash
+sudo nano /etc/caddy/Caddyfile
+```
+
+Et on va supprimer le bloc "http:// { ...} et mettre:
+
+```caddy
+status.lenomdedomaine (dans mon cas: status.davidscloud.live) {
+    reverse_proxy 127.0.0.1:3001
+}
+
+lenomdedomaine (dans mon cas: davidscloud.live){
+    root * /var/www/nextcloud
+    php_fastcgi unix//run/php-fpm/www.sock
+    file_server
+    header {
+      X-Forwarded-For {remote_host}
+      X-Forwarded-Proto {scheme}
+    }
+}
+
+```
+Attention: Si on ajoute pas le deuxieme bloc, le sous-domaine marche mais pas nextcloud (il devrait y avoir l'erreur "SSL handshake failed Error code 525").
+
+Et on peut vérifier que le fichier est valide avec et si tout est bon, on peut restart caddy:
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl restart caddy
+```
+
+C'est pas fini! Il faut maintenant modifier le fichier www.confi pour dire que caddy peut acceder au socket. Ca veut dire quand caddy essaie d'envoyer les requêtes PHP via ce socket, il n’a pas les droits nécessaires → 502 Bad Gateway.
+
+bash
+sudo nano /etc/php-fpm.d/www.conf
+```
+
+Il faut chercher les lignes:
+
+```ini
+listen.owner = caddy
+listen.group = caddy
+listen.mode = 0660
+.......
+listen.acl_users = apache,nginx,caddy
+listen.acl_groups = caddy
+listen.mode = 0660
+```
+
+Attention: Il faut enlever les ; au début des lignes
+
+On restart pour appliquer les modifications:
+
+```bash
+systemctl restart php-fpm
+```
+
+Normalement tout marche !
+
+## 11. Installtion de glances:
+
+Glances nous permet d'avoir la température du gpu, l'état des disques,...
+
+```bash
+sudo nano /etc/caddy/Caddyfile
+```
+
+
+```caddy
+monitor.mondomaine.com {
+    encode gzip
+    reverse_proxy 127.0.0.1:61208
+}
+
+```
+Ajouter monitor sur cloudflare comme pour Kuma
+
+
+On va créer un fichier pour que ca se lance automatiquement au démarrage:
+
+```bash
+sudo nano /etc/systemd/system/glances.service
+```
+
+On écrit:
+
+```ini
+[Unit]
+Description=Glances
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/glances -w
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Puis:
+
+```bash
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+sudo systemctl enable --now glances
+```
+
+
+Ensuite, configure Nextcloud pour faire confiance à Caddy:
+Édite le fichier :
+
+```bash
+sudo nano /var/www/nextcloud/config/config.php
+```
+
+Et ajoute ces deux lignes dans le tableau config :
+
+```php
+'trusted_proxies' => ['127.0.0.1'],
+'forwarded_for_headers' => ['HTTP_X_FORWARDED_FOR'],
+```
+
+On redémarre
+```bash
+sudo systemctl restart php-fpm
+sudo systemctl reload caddy
+```
+
+IL ME RESTE PLUS qu'a RESTREINDRE MONITOR.DAVIDSCLOUD.LIVE ET VOIR SI JE NE PEUX PAS INTEGRER STATUS ET MONITOR DIRECTEMENT SUR NEXTCLOUD
