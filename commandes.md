@@ -713,6 +713,32 @@ docker run -d \
   louislam/uptime-kuma
 ```
 
+(Optionnel: on peut rajouter une fonction qui shutdown le serveur a disatance grave a pyhton):
+
+```python                                                                                
+from flask import Flask, request, abort
+import subprocess
+import os
+
+app = Flask(__name__)
+
+SECRET_TOKEN = "e5367ac5aa4a894363b3e3bd410bf6fb425e79544edd801c29c9f74ec2adc8b7"
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    data = request.get_json()
+    if not data or 'token' not in data:
+        return jsonify({"error": "Token manquant"}), 400
+    if data['token'] != SECRET_TOKEN:
+        return jsonify({"error": "Token invalide"}), 403
+    os.system("shutdown now")
+    return jsonify({"message" : "Shutdown command sent"}), 200
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5005)
+```
+
 ### 3. Configurer le sous domaine (dans cloudflare):
 
 Dans cloudflare, on va créer un nouvel enregistrement DNS de type A:
@@ -742,7 +768,12 @@ Et on va supprimer le bloc "http:// { ...} et mettre:
 
 ```caddy
 status.lenomdedomaine (dans mon cas: status.davidscloud.live) {
-    reverse_proxy 127.0.0.1:3001
+    reverse_proxy 127.0.0.1:3001 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
 }
 
 lenomdedomaine (dans mon cas: davidscloud.live){
@@ -758,14 +789,33 @@ lenomdedomaine (dans mon cas: davidscloud.live){
 ```
 Attention: Si on ajoute pas le deuxieme bloc, le sous-domaine marche mais pas nextcloud (il devrait y avoir l'erreur "SSL handshake failed Error code 525").
 
-Et on peut vérifier que le fichier est valide avec et si tout est bon, on peut restart caddy:
+Ensuite on va configurer Nextcloud pour faire confiance à Caddy:
+
+```bash
+sudo nano /var/www/nextcloud/config/config.php
+```
+
+Et on va ajouter 2 lignes:
+
+```php
+<?php
+$CONFIG = array (
+  ........
+  'trusted_proxies' => ['127.0.0.1'],
+  'forwarded_for_headers' => ['HTTP_X_FORWARDED_FOR'],
+);
+```
+
+
+Et on peut vérifier que le fichier est valide avec et si tout est bon, on peut restart caddy et php:
 
 ```bash
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl restart caddy
+sudo systemctl restart php-fpm
 ```
 
-C'est pas fini! Il faut maintenant modifier le fichier www.confi pour dire que caddy peut acceder au socket. Ca veut dire quand caddy essaie d'envoyer les requêtes PHP via ce socket, il n’a pas les droits nécessaires → 502 Bad Gateway.
+C'est pas fini! Il faut maintenant modifier le fichier www.conf pour dire que caddy peut acceder au socket. Ca veut dire quand caddy essaie d'envoyer les requêtes PHP via ce socket, il n’a pas les droits nécessaires → 502 Bad Gateway.
 
 bash
 sudo nano /etc/php-fpm.d/www.conf
@@ -842,24 +892,178 @@ sudo systemctl enable --now glances
 ```
 
 
-Ensuite, configure Nextcloud pour faire confiance à Caddy:
-Édite le fichier :
+
+
+
+
+
+ET VOIR SI JE NE PEUX PAS INTEGRER STATUS ET MONITOR DIRECTEMENT SUR NEXTCLOUD
+
+## 12. Ajout d'un "bouton" shutdown disponible sur kuma:
+
+L'idée est d'ajouter une notification qui va nous permetre de shutdown le serveur a distance depuis notre téléphone par exemple.
+
+On va installer fail2ban, pip (s'il n'est pas déjà installé) et flask:
+
+```bash
+sudo dnf install fail2ban -y
+sudo systemctl enable --now fail2ban
+sudo dnf install python3-pip -y
+pip3 install flask
+```
+
+### 1. On va créer un script shell pour éteindre le serveur:
+
+```bash
+sudo nano /usr/local/bin/shutdown-server.sh
+```
+
+Et on écrit:
+
+```bash
+#!/bin/bash
+/sbin/shutdown now
+```
+On le rend éxécutable:
+
+```bash
+sudo chmod +x /usr/local/bin/shutdown-server.sh
+```
+
+### 2. Création d'un petit serveur web local avec flask:
+
+```bash
+sudo nano /opt/shutdown_api.py
+```
+
+On écrit:
+
+```python
+from flask import Flask, request, jsonify
+import os
+
+app = Flask(__name__)
+
+
+SECRET_TOKEN = "abc123"  # remplace par un vrai mot de passe sécurisé
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    data = request.get_json()
+    if not data or 'token' not in data:
+        return jsonify({"error": "Token manquant"}), 400
+
+    if data['token'] != SECRET_TOKEN:
+        return jsonify({"error": "Token invalide"}), 403
+
+    os.system("shutdown now")
+    return jsonify({"message": "Shutdown command sent"}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5005)
+
+```
+
+ATTENTION: Il faut remplacer "ton_super_secret" par un token. Comment? avec la commande: `openssl rand -hex 32`
+
+### 3. Création d'un service systemd pour l'API flask:
+
+On va créer un service nommé shutdown-api.service:
+
+```bash
+sudo nano /etc/systemd/system/shutdown-api.service
+```
+
+On y met:
+```ini
+[Unit]
+Description=Shutdown API Flask service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/shutdown_api.py
+Restart=on-failure
+User=root
+WorkingDirectory=/opt
+
+[Install]
+WantedBy=multi-user.target
+```
+
+On va ensuite activer puis démarrer le service:
+
+```bash
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+sudo systemctl enable --now shutdown-api.service
+```
+
+On peut vérifier qu'il tourne bien:
+
+```bash
+sudo systemctl status shutdown-api.service
+```
+
+### 4. Modification du fichier config.php:
+
+Si on va regarder sur les sous domaine, on a une erreur de nextcloud qui nous dit "Accès à partir d'un domaine non approuvé".
+
+On va aller modifier:
 
 ```bash
 sudo nano /var/www/nextcloud/config/config.php
 ```
 
-Et ajoute ces deux lignes dans le tableau config :
+Et on va ajouter:
 
 ```php
-'trusted_proxies' => ['127.0.0.1'],
-'forwarded_for_headers' => ['HTTP_X_FORWARDED_FOR'],
+'trusted_domains' => 
+array (
+  0 => 'localhost',
+  1 => '192.168.1.100',
+  2 => 'davidscloud.live',
+  3 => 'www.davidscloud.live',
+  4 => 'status.davidscloud.live',
+  4 => 'monitor.davidscloud.live',
+),
 ```
 
-On redémarre
+Puis on redémarre:
+
 ```bash
 sudo systemctl restart php-fpm
 sudo systemctl reload caddy
 ```
 
-IL ME RESTE PLUS qu'a RESTREINDRE MONITOR.DAVIDSCLOUD.LIVE ET VOIR SI JE NE PEUX PAS INTEGRER STATUS ET MONITOR DIRECTEMENT SUR NEXTCLOUD
+ATTENTION:  S'il y a une erreur sur les sous domaine, ca se peut qu'il y a un problème avec le port 80:
+On peut tester avec:
+
+```bash
+sudo systemctl stop httpd nginx
+```
+
+On accède au site et on voit si tout marche, si oui alors on peut faire `sudo systemctl disable httpd nginx`
+
+
+### 5. Ajout de la notification sur Kuma:
+
+Aller sur la sonde de votre site, clicker sur modifier, puis ajouter une notification:
+* Nom: Shutdown
+* Type de notification: webhook
+* Post URL: http://192.168.129.48:5005/shutdown
+* Coprs de la requete: Application/json:
+```json
+{
+  "token": "abc123"
+}
+```
+* En tête supplémentaire:
+```json
+{
+  "Content-Type": "application/json"
+}
+```
+
+Et normalement si on appuies sur tester, ça devrait shutdown le serveur
+
+REGARDER DANS LE FICHIER CADDY DANS STATUS SI J'AI CHANGÉ LE FICHIER, REGARDER SI DANS LE FICHIER PYTHON C'EST 5005 OU 5050 ET AJOUTER DANS MD sudo firewall-cmd --add-port=5050/tcp --permanent
